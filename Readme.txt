@@ -1,8 +1,8 @@
 Readme
 ******
 
-Goals:
-- Added LiquidTWI library for Adafruit 12c LCD Backpack
+Goals (See ChangeLog.txt for implementation status):
+- Add LiquidTWI library for Adafruit 12c LCD Backpack
 - Servo-controlled door
 - Cooling fan
 - PID for the cool stage
