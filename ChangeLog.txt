@@ -1,0 +1,6 @@
+3 Feb, 2014
+
+- Initial fork
+- Deleted all the schematic files because this version isn't compatible with the RocketScream hardware. (Sorry RocketScream! Your shield and sketch rock, but I wanted some different features.)
+- Updated Readme.txt
+- Added ChangeLog.txt
