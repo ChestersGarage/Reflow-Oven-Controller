@@ -11,7 +11,7 @@ Goals (See ChangeLog.txt for implementation status):
  
 Additional Required Libraries
 =============================
-- LiquidTWI Library for high-performance 12c serial LCD
+- LiquidTWI Library for high-performance i2c serial LCD
 >> http://forums.adafruit.com/viewtopic.php?f=19&t=21586&p=113177
 
 IMPORTANT:
