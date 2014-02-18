@@ -4,8 +4,9 @@ Readme
 Goals (See ChangeLog.txt for implementation status):
 - Add LiquidTWI library for Adafruit i2c LCD Backpack (DONE)
 - Servo-controlled door (DONE)
-- Cooling fan
-- PID for the cool stage
+- Cooling fan (In progress)
+- PID for the cool stage (Just started)
+- More useful LED and buzzer outputs
  
 Additional Required Libraries
 =============================

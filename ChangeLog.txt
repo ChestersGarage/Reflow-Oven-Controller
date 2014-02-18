@@ -1,16 +1,16 @@
 18 Feb, 2014
 
 Changes:
-- Added basic fan control (On/Off only)
+- Added basic fan control (On/Off only so far)
 - Added door servo control
-- Added RGB LED control
-- Removed MAX6675 support because I have no way to regression test, and it conflicted with new features, and it's no longer being sold.
+- Added RGB indicator LED control
+- Removed MAX6675 support because I have no way to regression test, it conflicted with new features, and it's no longer being sold.
 - Updated display info for 16x2
 - Tons of under-the-hood stuff
 
 Known Issues:
 - RGB LED color is wrong
-- Fan may cool too quickly
+- Fan may cool too quickly right after reflow
 - Preheat PID sometimes never crosses 150 C if ambient temp is too cold.
 
 To-Do:
