@@ -1,3 +1,26 @@
+18 Feb, 2014
+
+Changes:
+- Added basic fan control (On/Off only)
+- Added door servo control
+- Added RGB LED control
+- Removed MAX6675 support because I have no way to regression test, and it conflicted with new features, and it's no longer being sold.
+- Updated display info for 16x2
+- Tons of under-the-hood stuff
+
+Known Issues:
+- RGB LED color is wrong
+- Fan may cool too quickly
+- Preheat PID sometimes never crosses 150 C if ambient temp is too cold.
+
+To-Do:
+- Add PID/PWM control to fan
+- Make RGB LED behave correctly per stage/state
+- Add more beeper/buzzer control
+- Add selector for Pb/Sn and Pb-free reflow modes
+- Tune the PIDs so they work regardless of oven/ambient idiosyncrasies.
+
+
 3 Feb, 2014
 
 - Initial fork
