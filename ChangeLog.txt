@@ -1,3 +1,19 @@
+28 Feb, 2014
+
+Changes:
+- Added PID for cooling with the fan
+- Finished LED control patterns
+- Added buzzer control patterns
+- Almost a total rewrite to modularize the sketch so that features can be easily enabled/disabled
+
+Known Issues:
+- Reflow stages may be a little sketchy.  be sure tio tune for your oven
+- Reflow profiles for Pb/Sn and Pb-Free don't work (always Pb-Free)
+
+To-do:
+- Tune PIDs and ramps for reflow stages
+- Add actual Pb/Sn and Pb-Free reflow profiles
+
 18 Feb, 2014
 
 Changes:

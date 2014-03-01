@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Title: Reflow Oven Controller
- * Version: 1.20-cg-0.1
- * Date: 2 Feb, 2014
+ * Version: 1.20-cg-1.0
+ * Date: 22 Feb, 2014
  * Modified By: Mark Chester
  * Company: Chester's Garage
  * Web site: http://www.chestersgarage.com
@@ -10,7 +10,12 @@
  * - Added LiquidTWI library for Adafruit 12c LCD Backpack
  * - Servo-controlled door
  * - Cooling fan
- * - PID for the cool stage
+ * - PID for the cooling stage
+ * - Setpoint step ramp for all PIDs to handle different ovens and ambient conditions
+ * - Variety of buzzer patterns for different events
+ * - Variety of LED patterns for differennt events
+ * - 2nd button selects between Pb/Sn and Pb-Free reflow temperature profiles
+ * - Almost a total rewrite for modularity and easy changes
  * 
  * Additional Required Libraries
  * =============================
@@ -114,12 +119,28 @@
  * 1.00      Initial public release.
  *******************************************************************************/
 
-// Uncomment only one of the following for serial (LiquidTWI/Adafruit i2c 
-// LCD Backpack) or parallel (LiquidCrystal/Direct) LCD connection
-//#define LCD_PARALLEL
-#define LCD_SERIAL
+// ########## Debug ##########
+// Uncomment to enable serial data output
+#define DEBUG
 
-// ***** INCLUDES *****
+// ########## LCD Display Type ##########
+// Uncomment only one of the following for
+// serial (LiquidTWI/Adafruit i2c LCD Backpack) or
+// parallel (LiquidCrystal/Direct) LCD connection
+#define LCD_SERIAL
+//#define LCD_PARALLEL
+
+// ########## Features ##########
+// Comment out whichever of these your oven does not have.
+#define DOORSERVO
+#define RGBLED
+#define BUZZER
+#define COOLINGFAN
+
+// ########## Libraries ##########
+#include <MAX31855.h>
+#include <PID_v1.h>
+
 #ifdef LCD_SERIAL
 #include <LiquidTWI.h>
 #include <Wire.h>
@@ -127,645 +148,917 @@
 #include <LiquidCrystal.h>
 #endif
 
-#include <MAX31855.h>
+#ifdef DOORSERVO
 #include <Servo.h>
-#include <PID_v1.h>
+#endif
 
-// ***** TYPE DEFINITIONS *****
-typedef enum REFLOW_STATE
-{
-  REFLOW_STATE_IDLE,
-  REFLOW_STATE_PREHEAT,
-  REFLOW_STATE_SOAK,
-  REFLOW_STATE_REFLOW,
-  REFLOW_STATE_COOL,
-  REFLOW_STATE_COMPLETE,
-  REFLOW_STATE_TOO_HOT,
-  REFLOW_STATE_ERROR
-} 
-reflowState_t;
+// ########## Oven State ##########
+boolean ovenStateInit = true;           // Flag to tell the oven state machine to initialize the new state
+typedef enum OVEN_STATE {               // Defines the different states and stages of oven operation
+  OVEN_STATE_IDLE,                      // Oven is doing nothing and is cooled
+  OVEN_STATE_PREHEAT,                   // Preheat stage of the reflow process
+  OVEN_STATE_SOAK,                      // Soak stage of the reflow process
+  OVEN_STATE_REFLOW,                    // Reflow stage of the reflow process
+  OVEN_STATE_COOLING,                   // Cooling stage of the reflow process
+  OVEN_STATE_CAUTION,                   // The oven is idle but still hot
+  OVEN_STATE_ERROR,                     // A problem with the thermocouple
+} ovenState_t;
+ovenState_t ovenState;                  // Reflow oven controller state machine state variable
 
-typedef enum REFLOW_STATUS
-{
-  REFLOW_STATUS_OFF,
-  REFLOW_STATUS_ON
-} 
-reflowStatus_t;
-
-typedef	enum SWITCH
-{
-  SWITCH_NONE,
-  SWITCH_1,	
-  SWITCH_2
-}	
-switch_t;
-
-typedef enum DEBOUNCE_STATE
-{
-  DEBOUNCE_STATE_IDLE,
-  DEBOUNCE_STATE_CHECK,
-  DEBOUNCE_STATE_RELEASE
-} 
-debounceState_t;
-
-// ***** CONSTANTS *****
-#define TEMPERATURE_ROOM 50
-#define TEMPERATURE_SOAK_MIN 150
-#define TEMPERATURE_SOAK_MAX 200
-#define TEMPERATURE_REFLOW_MAX 250
-#define TEMPERATURE_COOL_MIN 100
-#define SENSOR_SAMPLING_TIME 1000
-#define SOAK_TEMPERATURE_STEP 5
-#define SOAK_MICRO_PERIOD 9000
-#define DEBOUNCE_PERIOD_MIN 50
-#define DOOR_OPEN_LIMIT 38
-#define DOOR_CLOSE_LIMIT 168
-
-// ***** PID PARAMETERS *****
-// ***** PRE-HEAT STAGE *****
+// ########## PID Control ##########
+#define TEMPERATURE_IDLE 50             // Oven maximum IDLE temperature.
+#define TEMPERATURE_PREHEAT_STEP 9      // Number of degrees C per PERIOD the PREHEAT stage can heat up
+#define TEMPERATURE_PREHEAT_PERIOD 3000 // Time between PREHEAT steps
+#define TEMPERATURE_PREHEAT_MAX 150     // Target temperature of the PREHEAT stage
+#define TEMPERATURE_SOAK_STEP 5         // Maximum number of degrees C per PERIOD the SOAK stage can heat up
+#define TEMPERATURE_SOAK_PERIOD 9000    // Time between SOAK steps
+#define TEMPERATURE_SOAK_MAX 200        // Target temperature of the SOAK stage
+#define TEMPERATURE_REFLOW_STEP 9       // Maximum number of degrees C per PERIOD the REFLOW stage can heat up
+#define TEMPERATURE_REFLOW_PERIOD 3000  // Time between REFLOW steps
+#define TEMPERATURE_REFLOW_MAX 250      // Target temperature of the REFLOW stage
+#define TEMPERATURE_COOLING_STEP 6      // Number of degrees C per PERIOD the COOLING stage can cool down
+#define TEMPERATURE_COOLING_PERIOD 2000 // Time between COOLING steps
+#define TEMPERATURE_COOLING_MIN 50      // Target temperature of the COOLING stage
+#define PID_COMPUTE_PERIOD 250          // How often the PID will be evaluated
+// Preheat stage PID tuning
 #define PID_KP_PREHEAT 100
 #define PID_KI_PREHEAT 0.025
 #define PID_KD_PREHEAT 20
-// ***** SOAKING STAGE *****
+// Soak stage PID tuning
 #define PID_KP_SOAK 300
 #define PID_KI_SOAK 0.05
 #define PID_KD_SOAK 250
-// ***** REFLOW STAGE *****
+// Reflow stage PID tuning
 #define PID_KP_REFLOW 300
 #define PID_KI_REFLOW 0.05
 #define PID_KD_REFLOW 350
-// ***** COOL STAGE *****   NEED TO FIGURE OUT WHAT THESE SHOULD BE
-#define PID_KP_COOL 300
-#define PID_KI_COOL 0.05
-#define PID_KD_COOL 350
+// Cooling stage PID tuning
+#define PID_KP_COOLING 25
+#define PID_KI_COOLING 0.0125
+#define PID_KD_COOLING 5
+// General PID variables
+double input;                      // The input is the temperature reading form the thermocouple
+double kp = PID_KP_PREHEAT;        // Since the first stage is always PREHEAT, we set it here
+double ki = PID_KI_PREHEAT;
+double kd = PID_KD_PREHEAT;
+double setpoint;                   // The current target temperature of the PID.  This changes a lot.
+double setpointMax;                // The maximum setpoint for any given stage.  Eliminates severe overshoot
+byte setpointStep;                 // The number of degrees C to increment the setpoint for the current stage
+int windowSize = 1000;             // The duration of the PID window in millis()
+unsigned long windowStartTime;     // Time in millis() when the PID window started
+unsigned long rightNow;            // Current time in millis()
+unsigned long stepTimer;           // The timer used to increment setpoint through the PID ramp time
+int stepTimerPeriod;               // The time in millis() to increment the timer for the current stage
+typedef enum PID_STATE {           // Defines the possibel PID states
+  PID_STATE_OFF,                   // PIDs are off
+  PID_STATE_HEAT,                  // Heater PID is running
+  PID_STATE_COOL,                  // Fan/cooling PID is running
+} pidState_t;
+pidState_t pidState;               // Reflow oven controller status
+// Heat PID specific settings
+#define ssrPin 2                   // The Arduino pin used by the SSR
+double heatOutput;                 // The heat PID output variable
+// Cool PID specific settings
+#ifdef COOLINGFAN                  // This section used only if you have a cooling fan
+#define fanPin 6                   // The Arduino pin of the cooling fan
+double coolOutput;                 // The output variable of the cooling PID
+#endif
 
-#define PID_SAMPLE_TIME 1000
-
-// ***** LCD MESSAGES *****
-const char* lcdMessagesReflowStatus[] = {
-  "-- Oven Ready --",
-  "Stage: Pre-Heat ",
-  "Stage: Soak     ",
-  "Stage: Reflow   ",
-  "Stage: Cooling  ",
-  "Reflow Complete ",
-  "Caution, HOT!   ",
-  "**** Error! ****"
+// ########## LCD Display ##########
+const char* lcdMessagesOvenStatus[] = {  // Defines all of the standard LCD messages
+  "-- Oven Ready --",                    // Oven IDLE state
+  "Stage: Preheat  ",                    // Reflow PREHEAT stage
+  "Stage: Soak     ",                    // Reflow SOAK stage
+  "Stage: Reflow   ",                    // Reflow REFLOW stage
+  "Stage: Cooling  ",                    // Reflow COOLING stage
+  "+++ OVEN HOT +++",                    // Oven CAUTION state
+  "**** ERROR! ****",                    // Oven ERROR state
 };
-
-// ***** DEGREE SYMBOL FOR LCD *****
-unsigned char degree[8]  = {
-  140,146,146,140,128,128,128,128};
-
-// ***** PIN ASSIGNMENT *****
-#ifdef LCD_PARALLEL
-#define lcdRsPin 12
+// LCD pin assignment
+#ifdef LCD_PARALLEL                      // Used only for PARALLEL LCD
+#define lcdRsPin 12                      // Arduino pins used for the LCD
 #define lcdEPin 11
 #define lcdD4Pin 5
 #define lcdD5Pin 4
 #define lcdD6Pin 3
 #define lcdD7Pin 2
-#else
-// Serial always uses A4 (DAT/SDA) and A5 (CLK/SCL)
+#else                                     // Used only for the SERIAL LCD
+// Serial LCD always uses A4 (DAT/SDA) and A5 (CLK/SCL)
+// It's a hardware requirement, cannot be changed
+#define lcdI2CAddress 0                   // i2c Address of the serial LCD display
+#endif
+#define DISPLAY_UPDATE_PERIOD 1000        // How often to update the LCD Display
+unsigned char degree[8] = {140,146,146,140,128,128,128,128}; // Creates a nifty little degree symbol
+unsigned long nextDisplay;                // The time in millis() when to update the LCD
+
+// ########## Thermocouple ##########
+#define thermocoupleSOPin A3              // Themocouple serial data SO pin
+#define thermocoupleCSPin A2              // Themocouple serial data CS pin              
+#define thermocoupleCLKPin A1             // Themocouple serial data CLK pin
+#define INPUT_READ_PERIOD 250             // How often to read the thermocouple
+unsigned long nextRead;                   // When to read the thermocouple next
+
+// ########## Reflow Profile ##########
+boolean reflowProfile = 0;                // 0: Pb-Free, 1: Pb/Sn
+
+// ########## Buttons ##########
+#define buttonPin A0                      // Arduino pin used for the button input
+boolean buttonDebouncing;                 // If true, we're waiting to see if the button bounces
+byte buttonNumber = 0, lastButton;        // Button ID variables
+int buttonReadValue;                      // Value of the analog input pin used for buttons
+unsigned long buttonLockoutTime = 0;      // We won't look for a button press within this period
+unsigned long lastDebounceTime;           // Switch debounce timer
+typedef	enum BUTTON_STATE {               // Defines the button states
+  BUTTON_STATE_NONE,                      // No button is pressed
+  BUTTON_STATE_1,	                  // Button 1 is pressed; start and cancel reflow
+  BUTTON_STATE_2,                         // Button 2 is pressed; select Pb/SN or Pb-Free reflow profile
+} buttonState_t;
+buttonState_t buttonState;                // Button press status
+
+// ########## Door Servo ##########
+#ifdef DOORSERVO                          // Only used is you have a door servo
+#define DOOR_OPEN_LIMIT 38                // Servo position when the door is fully open
+#define DOOR_CLOSE_LIMIT 168              // Servo position when the door is fully closed
+#define doorServoPin 5                    // Arduino pin used for the servo 
+boolean doorStateInit = false;            // if true, we just started opening the door
+byte doorPosition;                        // Range 0-180 degrees; For my servo, lower number is open and higher is closed
+byte doorMovePeriod;                      // How long to wait between increments of door movement
+byte doorMoveStep;                        // How far to move the door in each increment
+unsigned long doorMoveTime = 0;           // When to move the door next
+typedef	enum DOOR_STATE {                 // Define the diffeerent states of the door
+  DOOR_STATE_NONE,	                  // The door is not doing anything
+  DOOR_STATE_RELEASE,                     // Release the door (detach the servo)
+  DOOR_STATE_OPEN,	                  // The door is open
+  DOOR_STATE_CLOSED,                      // The way is shut.
+} doorState_t;
+doorState_t doorState;                    // Door (servo) status
 #endif
 
-#define ssrPin 2
-#define thermocoupleSOPin A3
-#define thermocoupleCSPin A2
-#define thermocoupleCLKPin A1
-#define ledRedPin 9
-#define ledGreenPin 10
-#define ledBluePin 11
-#define buzzerPin 3
-#define switchPin A0
-#define fanPin 6
-#define doorServoPin 5
-
-// ***** PID CONTROL VARIABLES *****
-double setpoint;
-double input;
-double heatOutput;
-double coolOutput;
-double kp = PID_KP_PREHEAT;
-double ki = PID_KI_PREHEAT;
-double kd = PID_KD_PREHEAT;
-int windowSize = 2000;
-unsigned long windowStartTime;
-unsigned long nextCheck;
-unsigned long nextRead;
-unsigned long timerSoak;
-unsigned long buzzerPeriod;
-byte doorStatus = 3; // 1: open, 2: closed, 3: unknown
-byte doorPos; // For my servo, lower number is open and higher is closed
-
-// Current time
-unsigned long now;
-// Reflow oven controller state machine state variable
-reflowState_t reflowState;
-// Reflow oven controller status
-reflowStatus_t reflowStatus;
-// Switch debounce state machine state variable
-debounceState_t debounceState;
-// Switch debounce timer
-long lastDebounceTime;
-// Switch press status
-switch_t switchStatus;
-// Seconds timer
-int timerSeconds;
-// i2c Addresses
-#define lcdI2CAddress 0
-
-// Specify PID control interface
-PID heatPID(&input, &heatOutput, &setpoint, kp, ki, kd, DIRECT);
-PID coolPID(&input, &coolOutput, &setpoint, kp, ki, kd, REVERSE);
-// Specify LCD interface
-#ifdef LCD_SERIAL
-LiquidTWI lcd(lcdI2CAddress);
-#else
-LiquidCrystal lcd(lcdRsPin, lcdEPin, lcdD4Pin, lcdD5Pin, lcdD6Pin, lcdD7Pin);
+// ########## LED Indicator ##########
+#ifdef RGBLED                             // Only used if you havd an RGB LED
+#define ledRedPin 9                       // Arduino pin used for the Red LED
+#define ledGreenPin 10                    // Arduino pin used for the Green LED 
+#define ledBluePin 11                     // Arduino pin used for the Blue LED
+boolean ledPatternInit;                   // If true, we just started runing an LED pattern
+boolean ledRedState = 0, ledGreenState = 0, ledBlueState = 0; // LED is on or off
+boolean ledState = HIGH;                  // Used in alternating between LED colors
+unsigned long ledPatternTime = 0, ledPatternPeriod; // Timer vars for blinking or alternating LED colors
+typedef enum LED_PATTERN {                // Defines LED pattern states
+  LED_PATTERN_IDLE,                       // Green/Blue slow alternate
+  LED_PATTERN_HEATING,                    // Red/Yellow alternate
+  LED_PATTERN_COOLING,                    // Cyan/Yellow alternate
+  LED_PATTERN_CAUTION,                    // Yellow fast blink
+  LED_PATTERN_ERROR,                      // Red very fast blink
+} ledPattern_t;
+ledPattern_t ledPattern;                  // RGB LED pattern state
 #endif
-// Specify thermocouple interface
-MAX31855 thermocouple(thermocoupleSOPin, thermocoupleCSPin, thermocoupleCLKPin);
+
+// ########## Buzzer ##########
+#ifdef BUZZER                             // Used only if you have a buzzer
+#define buzzerPin 3                       // Arduino pin used for the buzzer
+boolean buzzerState = LOW;                // Buzzer is off
+boolean buzzerPatternInit = true;         // If true, we've just started sounding the buzzer
+byte buzzerCycles;                        // How many beeps the buzzer makes
+byte buzzerCycleCount;                    // how many beeps the buzzer has made so far
+int buzzerPatternPeriod;                  // how long between buzzer beeps
+unsigned long buzzerPatternTime;          // When to make the next beep
+typedef enum BUZZER_PATTERN {             // Defines the buzzer pattern states
+  BUZZER_PATTERN_NONE,                    // The buzzer stays off
+  BUZZER_PATTERN_IDLE,                    // One long beep
+  BUZZER_PATTERN_START_REFLOW,            // Two short beeps
+  BUZZER_PATTERN_END_REFLOW,              // Three long beeps
+  BUZZER_PATTERN_CAUTION,                 // Five short beeps
+  BUZZER_PATTERN_ERROR,                   // Seven very short beeps
+} buzzerPattern_t;
+buzzerPattern_t buzzerPattern;            // Buzzer pattern state
+#endif
+
+// ########## Interfaces ##########
+// PID control
+PID heatPID(&input, &heatOutput, &setpoint, kp, ki, kd, DIRECT);  // The heater PID runs in the normal direction
+#ifdef COOLINGFAN                         // Only used if you have a fan
+PID coolPID(&input, &coolOutput, &setpoint, kp, ki, kd, REVERSE); // The cooling PID runs reverse: more fan = lower temperature
+#endif
+// LCD
+#ifdef LCD_SERIAL                         // Only used if you have a SERIAL LCD display
+LiquidTWI lcd(lcdI2CAddress);             // Initialize serial LCD interface
+#else                                     // Only if you have a PARALLEL LCD display
+LiquidCrystal lcd(lcdRsPin, lcdEPin, lcdD4Pin, lcdD5Pin, lcdD6Pin, lcdD7Pin); // Initialize the parallel LCD interface
+#endif
+// Thermocouple
+MAX31855 thermocouple(thermocoupleSOPin, thermocoupleCSPin, thermocoupleCLKPin); // Initialize the thermocouple interface
 // Door servo
-Servo doorServo;
+#ifdef DOORSERVO                          // Only if you have a door servo
+Servo doorServo;                          // Initialize the servo interface
+#endif
 
+// ##########  ##########
 void setup(){
-  // SSR pin initialization to ensure reflow oven is off
-  digitalWrite(ssrPin, LOW);
-  pinMode(ssrPin, OUTPUT);
-
-  // Buzzer pin initialization to ensure annoying buzzer is off
-  digitalWrite(buzzerPin, LOW);
-  pinMode(buzzerPin, OUTPUT);
-
-  // Door servo pin mode
-  doorServo.detach();
-  pinMode(doorServoPin, OUTPUT);
-
-  // Fan pin mode
-  digitalWrite(fanPin, LOW);
-  pinMode(fanPin, OUTPUT);
-
-  // LED pins initialization and turn on upon start-up (active low)
-  digitalWrite(ledRedPin, LOW);
-  pinMode(ledRedPin, OUTPUT);
-  digitalWrite(ledGreenPin, LOW);
+  // For pin initialization, we set safe/preferred logic level before setting mode
+  digitalWrite(ssrPin, LOW);       // SSR pin initialization to ensure reflow oven is off
+  pinMode(ssrPin, OUTPUT);         // Now it's safe to set the pin to OUPTPUT
+#ifdef BUZZER                             
+  digitalWrite(buzzerPin, LOW);    // Buzzer pin initialization to ensure annoying buzzer is off
+  pinMode(buzzerPin, OUTPUT);      // Now it's safe to set the pin to OUPTPUT
+#endif
+#ifdef DOORSERVO
+  pinMode(doorServoPin, OUTPUT);   // Now it's safe to set the pin to OUPTPUT
+#endif
+#ifdef COOLINGFAN
+  digitalWrite(fanPin, LOW);       // Fan pin 
+  pinMode(fanPin, OUTPUT);         // Now it's safe to set the pin to OUPTPUT
+#endif
+#ifdef RGBLED
+  digitalWrite(ledRedPin, HIGH);   // LED pins initialization and turn off at start-up (active low)
+  pinMode(ledRedPin, OUTPUT);      // Now it's safe to set the pins to OUPTPUT
+  digitalWrite(ledGreenPin, HIGH); 
   pinMode(ledGreenPin, OUTPUT);
-  digitalWrite(ledBluePin, LOW);
+  digitalWrite(ledBluePin, HIGH);
   pinMode(ledBluePin, OUTPUT);
-
-  // Start-up splash
-  digitalWrite(buzzerPin, HIGH);
-  lcd.begin(8, 2);
-  lcd.createChar(0, degree);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Reflow Oven 1.21");
-  lcd.setCursor(0, 1);
+#endif
+  // initialize LCD display and show startup info
+  lcd.begin(16, 2);              // Using a 16x2 LCD display
+  lcd.createChar(0, degree);     // Create a special "Degrees" symbol
+  lcd.clear();                   // Make sure there's not display garbage
+  lcd.setCursor(0,0);            // Show splash screen
+  lcd.print("Reflow Oven");
+  lcd.setCursor(0,1);
   lcd.print("Chester's Garage");
-  digitalWrite(buzzerPin, LOW);
-  delay(2500);
-  lcd.clear();
-
-  // Serial communication at 57600 bps
-  Serial.begin(57600);
-
-  // Initialize time keeping variable
-  nextCheck = millis();
-  // Initialize thermocouple reading variable
-  nextRead = millis();
+  delay(2000);                   // Sit on the sdtartup info for a moment
+  lcd.clear();                   // And then clear for operational info
+#ifdef DEBUG
+  Serial.begin(57600);           // Initialize serial communication at 57600 bps
   // Send header for CSV file
-  Serial.println("Time Setpoint Input Output reflowState");
+  // If you change these, update displaySerial() also
+  Serial.println("Input Setpoint Output");
+#endif
+  nextRead = millis();           // Initialize thermocouple reading variable
+  nextDisplay = millis();        // Initialize LCD/Serial display update variable
+  ovenStateInit = true;          // Initialize the oven state
+  ovenState = OVEN_STATE_IDLE;   // Set to state IDLE
+#ifdef RGBLED
+  ledPatternInit = true;         // Initialize the LED pattern
+  ledPattern = LED_PATTERN_IDLE; // Set pattern to IDLE
+#endif
+#ifdef DOORSERVO
+  doorStateInit = true;          // Initialize the door state
+  doorState = DOOR_STATE_NONE;   // Set door state to inactive
+#endif
+#ifdef BUZZER
+  buzzerPatternInit = true;      // Initialize the buzzer pattern
+  buzzerPattern = BUZZER_PATTERN_NONE; // Set the buzzer pattern to off
+#endif
 }
 
-void openDoor(){
-  doorServo.attach(doorServoPin);
-  doorServo.write(DOOR_OPEN_LIMIT+15);
-  delay(750);
-  for(doorPos = DOOR_OPEN_LIMIT+15; doorPos > DOOR_OPEN_LIMIT; doorPos -= 1){
-    doorServo.write(doorPos);
-    delay(50);
-  }
-  doorStatus = 1;
-}
-
-void closeDoor(){
-  doorServo.attach(doorServoPin);
-  doorServo.write(DOOR_CLOSE_LIMIT-15);
-  delay(750);
-  for(doorPos = DOOR_CLOSE_LIMIT-15; doorPos < DOOR_CLOSE_LIMIT; doorPos += 1){
-    doorServo.write(doorPos);
-    delay(50);
-  }
-  doorStatus = 2;
-}
-
-void releaseDoor(){
-  doorServo.detach();
-  doorStatus = 3;
-}
-
+// ########## Main Loop ##########
 void loop(){
-  // Time to read thermocouple?
-  if (millis() > nextRead){
-    // Read thermocouple next sampling period
-    nextRead += SENSOR_SAMPLING_TIME;
-    // Read current temperature
-    input = thermocouple.readThermocouple(CELSIUS);
-
-    // If thermocouple problem detected
-    if((input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || (input == FAULT_SHORT_VCC)){
-      // Illegal operation
-      reflowState = REFLOW_STATE_ERROR;
-      reflowStatus = REFLOW_STATUS_OFF;
-    }
+  readButtons();                          // Read the state of the buttons
+  if ( millis() > nextRead ) {            // If it's time to read the temperature
+    nextRead += INPUT_READ_PERIOD;        // Set the next read time
+    getOvenTemperature();                 // Read the thermocouple temperature and error conditions
   }
-
-  if (millis() > nextCheck){
-    // Check input in the next seconds
-    nextCheck += 1000;
-    // If reflow process is on going
-    if (reflowStatus == REFLOW_STATUS_ON){
-      // Toggle red LED as system heart beat
-      digitalWrite(ledRedPin, !(digitalRead(ledRedPin)));
-      // Increase seconds timer for reflow curve analysis
-      timerSeconds++;
-    }
-    else
-    {
-      // Turn off red LED
-      digitalWrite(ledRedPin, HIGH);
-    }
-    // Send temperature and time stamp to serial 
-    Serial.print(timerSeconds);
-    Serial.print(" ");
-    Serial.print(setpoint);
-    Serial.print(" ");
-    Serial.print(input);
-    Serial.print(" ");
-    Serial.print(heatOutput);
-    Serial.print(" ");
-    Serial.print(reflowState);
-    Serial.print(" ");
-    Serial.println(doorStatus);
-
-    // Print current system state
-    lcd.setCursor(0,0);
-    lcd.print(lcdMessagesReflowStatus[reflowState]);
-    // Move the cursor to the 2 line
-    lcd.setCursor(0,1);
-    // If currently in error state
-    if (reflowState == REFLOW_STATE_ERROR){
-      // No thermocouple wire connected
-      lcd.print("*** TC ERROR ***");
-    }
-    else{
-      // Print current temperature
-      lcd.print(input);
-      // Print degree Celsius symbol
-      lcd.write((uint8_t)0);
-      lcd.print("C ");
-    }
-    lcd.setCursor(9,1);
-    if ( heatOutput > 0 ) {
-      lcd.print("H:");
-      lcd.print(int(heatOutput));
-      lcd.print(" ");
-    }
-    if ( coolOutput > 0 ) {
-      lcd.print("C:");
-      lcd.print(int(coolOutput));
-      lcd.print(" ");
-    }
+#ifdef DOORSERVO
+  controlDoor();                          // Check/update the door
+#endif
+  computePID();                           // Determine whether we need to be hotter or cooler
+  runOvenState();                         // Set up stages and adjust input, output and display info
+  if ( millis() > nextDisplay ) {         // If it's time to update the LCD
+    nextDisplay += DISPLAY_UPDATE_PERIOD; // Set the next update time
+    updateLCDDisplay();                   // Write info to the LCD display
+#ifdef DEBUG
+    updateSerial();                       // Write info to serial
+#endif
   }
+#ifdef BUZZER
+  activateBuzzer();                       // Check/update the buzzer
+#endif
+#ifdef RGBLED                             
+  updateLed();                            // Check/update the RGB LED
+#endif
+}
 
-  // Reflow oven controller state machine
-  switch (reflowState){
-  case REFLOW_STATE_IDLE:
-    // Entry actions
-    // Disable PIDs
-    // Release door
-    if ( doorStatus != 3 ){
-      releaseDoor();
-    }
-    // Turn off fan
-    digitalWrite(fanPin, LOW);
-      // Long beep
-      // Set inidcator LED COOL
-      // Set LCD line 0 to OVEN_READY
-    
-    // While actions
-    // Check the oven temp and jump to OVEN_HOT if above TEMPERATURE_ROOM
-    if (input > TEMPERATURE_ROOM){
-      reflowState = REFLOW_STATE_TOO_HOT;
-    }
-    // Check for button 1 press and exit to PREHEAT.
-    else{
-      // If switch is pressed to start reflow process
-      if (switchStatus == SWITCH_1){
-        // Intialize seconds timer for serial debug information
-        timerSeconds = 0;
-        // Initialize PID control window starting time
-        windowStartTime = millis();
-        // Ramp up to minimum soaking temperature
-        setpoint = TEMPERATURE_SOAK_MIN;
-        // Tell the PID to range between 0 and the full window size
-        heatPID.SetOutputLimits(0, windowSize);
-        heatPID.SetSampleTime(PID_SAMPLE_TIME);
-        // Turn the PID on
-        heatPID.SetMode(AUTOMATIC);
-        // Proceed to preheat stage
-        reflowState = REFLOW_STATE_PREHEAT;
-      }
-    // Check for button 2 press and toggle PID params between Pb/Sn and Pb-free.
-    // Update LCD line 1 with Temperature
-    
-    // All exit actions
-    // Short beep
-    // Unset indicator LED COOL
+// ########## Door Servo Functions ##########
+#ifdef DOORSERVO                                     // Open and close the door
+void controlDoor(){
+  switch (doorState){
+    case DOOR_STATE_NONE:
+      // Intentional 'do nothing' state
+    break;
   
-    }
+    case DOOR_STATE_RELEASE:                         // After the door opens or closes, we release the servo
+      doorServo.detach();                            // Detach the servio
+      doorStateInit = true;                          // Stop movement
+      doorState = DOOR_STATE_NONE;                   // Done
     break;
-
-  case REFLOW_STATE_PREHEAT:
-    // Entry actions
-    // Set PID params for PREHEAT
-    // Set indicator LED HOT
-    // Set LCD line 0 to PREHEAT
-    // Close the door
     
-    // While actions
-    // Check for button 1 and exit to IDLE (cancel reflow)
-    // Update LCD line 1 with temperature and output
-    
-    // Exit actions
-    // Set exit to SOAK
-    // Short beep
-    
-    reflowStatus = REFLOW_STATUS_ON;
-    // Close the door and shut off the fan before doing anything else
-    digitalWrite(fanPin, LOW);
-    if ( doorStatus != 2 ){
-      closeDoor();
-    }
-    // If minimum soak temperature is achieve       
-    if (input >= TEMPERATURE_SOAK_MIN){
-      // Chop soaking period into smaller sub-period
-      timerSoak = millis() + SOAK_MICRO_PERIOD;
-      // Set less agressive PID parameters for soaking ramp
-      heatPID.SetTunings(PID_KP_SOAK, PID_KI_SOAK, PID_KD_SOAK);
-      // Ramp up to first section of soaking temperature
-      setpoint = TEMPERATURE_SOAK_MIN + SOAK_TEMPERATURE_STEP;   
-      // Proceed to soaking state
-      reflowState = REFLOW_STATE_SOAK; 
-    }
-    break;
-
-  case REFLOW_STATE_SOAK:
-    // Entry actions
-    // Set PID params for SOAK
-    // Set LCD to SOAK
-    
-    // While actions
-    // Check for button 1 and jump to IDLE (cancel reflow)
-    // Update LCD with temperature
-    // Update LCD with PID output
-    
-    // Exit actions
-    // Set exit to REFLOW
-    // Short beep
-
-    // Make sure the fan is off.
-    digitalWrite(fanPin, LOW);
-    // If the door isn't already closed, close it.
-    if ( doorStatus != 2 ){
-      closeDoor();
-    }
-    // If micro soak temperature is achieved       
-    if (millis() > timerSoak)
-    {
-      timerSoak = millis() + SOAK_MICRO_PERIOD;
-      // Increment micro setpoint
-      setpoint += SOAK_TEMPERATURE_STEP;
-      if (setpoint > TEMPERATURE_SOAK_MAX)
-      {
-        // Set agressive PID parameters for reflow ramp
-        heatPID.SetTunings(PID_KP_REFLOW, PID_KI_REFLOW, PID_KD_REFLOW);
-        // Ramp up to first section of soaking temperature
-        setpoint = TEMPERATURE_REFLOW_MAX;   
-        // Proceed to reflowing state
-        reflowState = REFLOW_STATE_REFLOW; 
+    case DOOR_STATE_OPEN:
+    // My servo has a high position value when the door is closed
+    // and a low position value when the door is open.
+      if ( doorStateInit ){                           // If we are initializing
+        doorStateInit = false;                        // Flip the initialize bit
+        doorMovePeriod = 50;                          // Set the step timer increment
+        doorMoveStep = 1;                             // Set the movement increment
+        doorServo.attach(doorServoPin);               // Attach the servo
+        doorPosition = DOOR_CLOSE_LIMIT;              // Set the current (starting) position
+        doorMoveTime = millis() + doorMovePeriod;     // Increment the door step timer
+      } else {                                        // If the door is already initialized
+        if ( millis() >= doorMoveTime ){              // Then check to see if it's time to move it some more
+          doorMoveTime = millis() + doorMovePeriod;   // Increment the step timer
+          doorPosition = doorPosition - doorMoveStep; // Increment the position
+          if ( doorPosition > DOOR_OPEN_LIMIT ){      // Make sure it's not at the open limit
+            doorServo.write(doorPosition);            // Move the door a little more
+          } else {                                    // If it is at the open limit
+            doorState = DOOR_STATE_RELEASE;           // Release servo control of the door.
+          }
+        }
       }
-    }
-    break; 
-
-  case REFLOW_STATE_REFLOW:
-    // Entry actions
-    // Set PID params for REFLOW
-    // Set LCD to REFLOW
-    
-    // While actions
-    // Check for button 1 and jump to IDLE (cancel reflow)
-    // Update LCD with temperature
-    // Update LCD with PID output
-    
-    // Exit actions
-    // Set exit to COOL
-    // Short beep
-
-    // We need to avoid hovering at peak temperature for too long
-    // Crude method that works like a charm and safe for the components
-    if (input >= (TEMPERATURE_REFLOW_MAX - 2))
-    {
-      // Set PID parameters for cooling ramp
-      heatPID.SetTunings(PID_KP_REFLOW, PID_KI_REFLOW, PID_KD_REFLOW);
-      // Ramp down to minimum cooling temperature
-      setpoint = TEMPERATURE_COOL_MIN;   
-      // Proceed to cooling state
-      reflowState = REFLOW_STATE_COOL; 
-    }
-    break;   
-
-  case REFLOW_STATE_COOL:
-    // Entry actions
-    // Set PID params for COOL
-    // Set LCD to COOL
-    
-    // While actions
-    // Update LCD with temperature
-    // Update LCD with PID output
-    
-    // Exit actions
-    // Set exit to IDLE
-    // Turn off HOT LED
-    // Short beep
-
-    // Open the door and turn on the fan for faster cooling
-    if ( doorStatus != 1 ){
-      openDoor();
-    }
-    digitalWrite(fanPin, HIGH);
-    // If minimum cool temperature is achieve       
-    if (input <= TEMPERATURE_COOL_MIN)
-    {
-      // Retrieve current time for buzzer usage
-      buzzerPeriod = millis() + 1000;
-      // Turn on buzzer and green LED to indicate completion
-      digitalWrite(buzzerPin, HIGH);
-      // Turn off reflow process
-      reflowStatus = REFLOW_STATUS_OFF;                
-      // Proceed to reflow Completion state
-      reflowState = REFLOW_STATE_COMPLETE; 
-    }         
-    break;    
-
-  case REFLOW_STATE_COMPLETE:
-    // DELETE THIS STAGE
-    // Release the door and shut off the fan
-    if ( doorStatus != 3 ){
-      releaseDoor();
-    }
-    digitalWrite(fanPin, LOW);
-    if (millis() > buzzerPeriod)
-    {
-      // Turn off buzzer and green LED
-      digitalWrite(buzzerPin, LOW);
-      // Reflow process ended
-      reflowState = REFLOW_STATE_IDLE; 
-    }
     break;
-
-  case REFLOW_STATE_TOO_HOT:
-    // Rename to OVEN_HOT
-
-    // Entry actions
-    // Set LED to CAUTION
-    // Set LCD to CAUTION
-    // Long beep
-    // Open door
-    // Turn on fan
     
-    // While actions
-    // Update LCD with temperature
-    // Update LCD with PID output
-    
-    // Exit actions
-    // Set exit to IDLE
-    // Short beep
-
-    // Open the door and turn on the fan to vent 
-    if ( doorStatus != 1 ){
-      openDoor();
-    }
-    digitalWrite(fanPin, HIGH);
-    // If oven temperature drops below room temperature
-    if (input < TEMPERATURE_ROOM)
-    {
-      // Ready to reflow
-      reflowState = REFLOW_STATE_IDLE;
-    }
-    break;
-
-  case REFLOW_STATE_ERROR:
-    // Let go of the door aand shut off the fan
-    if ( doorStatus != 3 ){
-      releaseDoor();
-    }
-    digitalWrite(fanPin, LOW);
-    // If thermocouple problem is still present
-    if((input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || 
-      (input == FAULT_SHORT_VCC))
-    {
-      // Wait until thermocouple wire is connected
-      reflowState = REFLOW_STATE_ERROR; 
-    }
-    else
-    {
-      // Clear to perform reflow process
-      reflowState = REFLOW_STATE_IDLE; 
-    }
-    break;    
-  }    
-
-  // If switch 1 is pressed
-  if (switchStatus == SWITCH_1){
-    // If currently reflow process is on going
-    if (reflowStatus == REFLOW_STATUS_ON)
-    {
-      // Button press is for cancelling
-      // Turn off reflow process
-      reflowStatus = REFLOW_STATUS_OFF;
-      // Reinitialize state machine
-      reflowState = REFLOW_STATE_IDLE;
-    }
-  } 
-
-  // Simple switch debounce state machine (for switch #1 (both analog & digital
-  // switch supported))
-  switch (debounceState){
-  case DEBOUNCE_STATE_IDLE:
-    // No valid switch press
-    switchStatus = SWITCH_NONE;
-    // If switch #1 is pressed
-    if (analogRead(switchPin) == 0)
-    {
-      // Intialize debounce counter
-      lastDebounceTime = millis();
-      // Proceed to check validity of button press
-      debounceState = DEBOUNCE_STATE_CHECK;
-    }	
-    break;
-
-  case DEBOUNCE_STATE_CHECK:
-    if (analogRead(switchPin) == 0)
-    {
-      // If minimum debounce period is completed
-      if ((millis() - lastDebounceTime) > DEBOUNCE_PERIOD_MIN)
-      {
-        // Proceed to wait for button release
-        debounceState = DEBOUNCE_STATE_RELEASE;
+    case DOOR_STATE_CLOSED:
+      if ( doorStateInit ){                           // If we are initializing
+        doorStateInit = false;                        // Flip the initialize bit
+        doorMovePeriod = 25;                          // Set the step timer increment
+        doorMoveStep = 1;                             // Set the movement increment
+        doorServo.attach(doorServoPin);               // Attach the servo
+        doorPosition = DOOR_OPEN_LIMIT;               // Set the current (starting) position
+        doorMoveTime = millis() + doorMovePeriod;     // Increment the door step timer
+      } else {                                        // If the door is already initialized
+        if ( millis() >= doorMoveTime ){              // Then check to see if it's time to move it some more
+          doorMoveTime = millis() + doorMovePeriod;   // Increment the step timer
+          doorPosition = doorPosition + doorMoveStep; // Increment the position
+          if ( doorPosition < DOOR_CLOSE_LIMIT ){     // Make sure it's not at the closed limit
+            doorServo.write(doorPosition);            // Move the door a little more
+          } else {                                    // If it is at the closed limit
+            doorState = DOOR_STATE_RELEASE;           // Release servo control of the door.
+          }
+        }
       }
-    }
-    // False trigger
-    else
-    {
-      // Reinitialize button debounce state machine
-      debounceState = DEBOUNCE_STATE_IDLE; 
-    }
-    break;
-
-  case DEBOUNCE_STATE_RELEASE:
-    if (analogRead(switchPin) > 0)
-    {
-      // Valid switch 1 press
-      switchStatus = SWITCH_1;
-      // Reinitialize button debounce state machine
-      debounceState = DEBOUNCE_STATE_IDLE; 
-    }
     break;
   }
+}
+#endif
 
-  // PID computation and SSR control
-  if (reflowStatus == REFLOW_STATUS_ON)
-  {
-    now = millis();
+// ########## LED Indicator Functions ##########
+#ifdef RGBLED
+void updateLed() {                              
+  // My RGB LED is common anode (+), so LOW=on, HIGH=off
+  switch (ledPattern){
+    case LED_PATTERN_IDLE:                   // Green/Blue slow alternate
+      if ( ledPatternInit ){                 // If we're initializing
+        ledPatternInit = false;              // Flip the initialize bit
+        ledPatternPeriod = 2000;             // Set the pattern period
+        ledState = LOW;                      // Initial state is On
+        ledPatternTime = millis() + ledPatternPeriod; // Increment the pattern timer
+      } else {                               // If we're not initializing
+        checkLedState();                     // Check the timer and flip the led state
+        digitalWrite(ledRedPin, HIGH);       // Set the LED states
+        digitalWrite(ledGreenPin, ledState); 
+        digitalWrite(ledBluePin, !ledState);
+      }
+    break;
+    
+    case LED_PATTERN_HEATING:                // Red/Yellow alternate
+      if ( ledPatternInit ){
+        ledPatternInit = false;
+        ledPatternPeriod = 500;
+        ledState = LOW;
+        ledPatternTime = millis() + ledPatternPeriod;
+      } else {
+        checkLedState();
+        digitalWrite(ledRedPin, LOW);
+        digitalWrite(ledGreenPin, ledState);
+        digitalWrite(ledBluePin, HIGH);
+      }
+    break;
+    
+    case LED_PATTERN_COOLING:                // Cyan/Yellow alternate
+      if ( ledPatternInit ){
+        ledPatternInit = false;
+        ledPatternPeriod = 500;
+        ledState = LOW;
+        ledPatternTime = millis() + ledPatternPeriod;
+      } else {
+        checkLedState();
+        digitalWrite(ledRedPin, ledState);
+        digitalWrite(ledGreenPin, LOW);
+        digitalWrite(ledBluePin, !ledState);
+      }
+    break;
+    
+    case LED_PATTERN_CAUTION:                // Yellow fast blink
+      if ( ledPatternInit ){
+        ledPatternInit = false;
+        ledPatternPeriod = 250;
+        ledState = LOW;
+        ledPatternTime = millis() + ledPatternPeriod;
+      } else {
+        checkLedState();
+        digitalWrite(ledRedPin, ledState);
+        digitalWrite(ledGreenPin, ledState);
+        digitalWrite(ledBluePin, HIGH);
+      }
+    break;
 
-    heatPID.Compute();
+    case LED_PATTERN_ERROR:                  // Red extra fast blink
+      if ( ledPatternInit ){
+        ledPatternInit = false;
+        ledPatternPeriod = 100;
+        ledState = LOW;
+        ledPatternTime = millis() + ledPatternPeriod;
+      } else {
+        checkLedState();
+        digitalWrite(ledRedPin, ledState);
+        digitalWrite(ledGreenPin, HIGH);
+        digitalWrite(ledBluePin, HIGH);
+      }
+    break;
+  }
+}
 
-    if((now - windowStartTime) > windowSize) { 
-      // Time to shift the Relay Window
-      windowStartTime += windowSize;
+void checkLedState(){                             // Checks the timer and flips the LED state
+  if ( millis() > ledPatternTime){                // If it time
+    ledState = !ledState;                         // Flip the led state
+    ledPatternTime = millis() + ledPatternPeriod; // Increment the timer
+  }
+}
+#endif
+
+// ########## Buzzer Functions ##########
+#ifdef BUZZER
+void activateBuzzer(){
+  switch (buzzerPattern){
+    case BUZZER_PATTERN_NONE:
+      // Intentional 'do nothing' state
+    break;
+    
+    // All of the buzzer patterns have a silent section at the end.
+    // This allows an 'end' buzzer to sequence nicely with a 'begin' buzzer.
+    case BUZZER_PATTERN_IDLE:       // One long beep
+      if ( buzzerPatternInit ){     // If we're initializing
+        buzzerPatternInit = false;  // Flip the initialization bit
+        buzzerPatternPeriod = 1000; // Set the pattern period 
+        buzzerCycles = 2;           // Beep ONCE (and one 'off' period)
+        buzzerCycleCount = 1;       // Start at the beginning
+        buzzerState = HIGH;         // Turn on the buzzer
+        buzzerPatternTime = millis() + buzzerPatternPeriod; // Set the timer
+      } else {
+        playBuzzer();
+      }
+    break;
+    
+    case BUZZER_PATTERN_START_REFLOW: // Two short beeps
+      if ( buzzerPatternInit ){
+        buzzerPatternInit = false;
+        buzzerPatternPeriod = 250;
+        buzzerCycles = 4;
+        buzzerCycleCount = 1;
+        buzzerState = HIGH;
+        buzzerPatternTime = millis() + buzzerPatternPeriod;
+      } else {
+        playBuzzer();
+      }
+    break;
+    
+    case BUZZER_PATTERN_END_REFLOW:   // Three long beeps
+      if ( buzzerPatternInit ){
+        buzzerPatternInit = false;
+        buzzerPatternPeriod = 1000;
+        buzzerCycles = 6;
+        buzzerCycleCount = 1;
+        buzzerState = HIGH;
+        buzzerPatternTime = millis() + buzzerPatternPeriod;
+      } else {
+        playBuzzer();
+      }
+    break;
+    
+    case BUZZER_PATTERN_CAUTION:      // Five short beeps
+      if ( buzzerPatternInit ){
+        buzzerPatternInit = false;
+        buzzerPatternPeriod = 250;
+        buzzerCycles = 10;
+        buzzerCycleCount = 1;
+        buzzerState = HIGH;
+        buzzerPatternTime = millis() + buzzerPatternPeriod;
+      } else {
+        playBuzzer();
+      }
+    break;
+    
+    case BUZZER_PATTERN_ERROR:        // Seven very short beeps
+      if ( buzzerPatternInit ){
+        buzzerPatternInit = false;
+        buzzerPatternPeriod = 100;
+        buzzerCycles = 14;
+        buzzerCycleCount = 1;
+        buzzerState = HIGH;
+        buzzerPatternTime = millis() + buzzerPatternPeriod;
+      } else {
+        playBuzzer();
+      }
+    break;
+  }
+}
+
+void playBuzzer(){                         // Watches for the end of the pattern and sets the buzzer on/off state
+  if ( buzzerCycleCount >= buzzerCycles ){ // If we've reaced the end of the pattern
+    buzzerPatternInit = true;              // Set initialization for next time
+    buzzerPattern = BUZZER_PATTERN_NONE;   // Set the pattern to nothing
+  }
+  if ( millis() > buzzerPatternTime){      // If the pattern timer has elapsed
+    buzzerCycleCount += 1;                 // Increment the cycle count
+    buzzerState = !buzzerState;            // Flip the buzzer state
+    buzzerPatternTime = millis() + buzzerPatternPeriod; // Increment the timer
+  }
+  digitalWrite(buzzerPin, buzzerState);    // Set the buzzer
+}
+#endif
+
+// ########## PID Functions ##########
+void managePidSetpoint(){                   // Manages the PID setpoint ramp
+  if ( millis() > stepTimer ){              // If the step timer has elapsed
+    stepTimer = millis() + stepTimerPeriod; // Increment the timer by the step timer period
+    if ( pidState == PID_STATE_HEAT ){      // If we're in HEAT mode
+      setpoint += setpointStep;             // Increment the setpoint by the setpoint step
+      if ( setpoint > setpointMax ){        // When we pass the max setpoint
+        setpoint = setpointMax;             // Force the setpoint back to the max
+      }
     }
-    if(heatOutput > (now - windowStartTime)) {
-      digitalWrite(ssrPin, HIGH);
+#ifdef COOLINGFAN
+    if ( pidState == PID_STATE_COOL ){       // If we're in COOL mode
+      setpoint -= setpointStep;              // Decrement the setpoint by the setpoint step
+      if ( setpoint < setpointMax ){         // When we pass the min setpoint (max)
+        setpoint = setpointMax;              // Force the setpoint back to min (max)
+      }
     }
-    else {
-      digitalWrite(ssrPin, LOW);   
+#endif
+  }
+}
+
+void computePID() {                                    // Heat/cool PID computation and SSR/fan control
+  if ( pidState == PID_STATE_HEAT ){                   // If we're in heating mode
+    rightNow = millis();                               // Capture the current time
+    heatPID.Compute();                                 // Compute the heating PID
+    if ( rightNow > (windowStartTime + windowSize) ){  // If the PID output window has elapsed
+      windowStartTime += windowSize;                   // Reset the window start time
+    }
+    if ( (rightNow - windowStartTime) <= heatOutput ){ // If the elsapsed time is less than the heater PID output
+      digitalWrite(ssrPin, HIGH);                      // Make sure the heating element is on
+    } else {
+      digitalWrite(ssrPin, LOW);                       // Otherwise shut it off
+    }
+  } else {                                             // If we're NOT in heat node
+    digitalWrite(ssrPin, LOW);                         // Turn off the heater element
+  }
+#ifdef COOLINGFAN
+  if ( pidState == PID_STATE_COOL ){                   // If we're in cooling mode
+    coolPID.Compute();                                 // Compute the cooling PID
+    analogWrite(fanPin,coolOutput);                    // And set the fan speed
+  } else {                                             // If we're NOT in cooling mode
+    analogWrite(fanPin,0);                             // Turn off the fan
+  }
+#endif
+}
+
+// ########## Reflow Profile Functions ##########
+void toggleReflowProfile(){        // Switched between lead and lead free reflow profiles
+  reflowProfile = !reflowProfile;  // Flip the reflow profile flag
+  lcd.setCursor(0,1);              // Place the LCD cursor on the second line
+  if ( reflowProfile ){            // If the profile is now Pb/Sn
+    lcd.print("Profile: Pb/Sn  "); // Print Pb/Sn
+  }
+  else{                            // Otherwise
+    lcd.print("Profile: Pb-Free"); // Print Pb-Free
+  }
+  delay(2000);                     // Wait for 3 seconds
+  lcd.clear();                     // And then wipe the screen
+}
+
+// ########## Button Functions ##########
+void readButtons(){                                          // Debounce for buttons on analog input pin
+  if ( millis() > buttonLockoutTime ){                       // If we're past the lockout period
+    buttonReadValue = analogRead(buttonPin);                 // Read the button pin
+    // Set up the array of buttons.
+    // Due to the level of noise I get on the analog input,
+    // I dropped the threshold for a button press very low (600).
+    if ( buttonReadValue > 600 ){ buttonNumber = 0; }        // Button 0 means no button was pressed
+    if ( buttonReadValue >= 0 && buttonReadValue < 510 ){ buttonNumber = 1; }  // Button 1 pressed
+    if ( (buttonReadValue > 510) && (buttonReadValue < 600) ){ buttonNumber = 2; }  // button 2 pressed
+    if ( (millis() - lastDebounceTime) > 50 ){               // If debounce timer has elapsed
+      if ( buttonNumber != 0 && !buttonDebouncing ){         // If a button is being pressed AND we're not already debouncing
+        lastDebounceTime = millis();                         // Set the debounce time
+        buttonDebouncing = true;                             // Set the debounce flag
+      } // If the button number changes, reset the debounce timer
+      if ( buttonNumber == 0 ){                              // No button
+        buttonState = BUTTON_STATE_NONE;                     // Set the button states
+      }
+      if ( buttonNumber == 1 ){
+        buttonState = BUTTON_STATE_1;
+        buttonLockoutTime = millis() + 1000;                 // If we have a valid button press, lock out other presses for 1 second
+      }
+      if ( buttonNumber == 2 ){
+        buttonState = BUTTON_STATE_2;
+        buttonLockoutTime = millis() + 1000;
+      }
     }
   }
-  // Reflow oven process is off, ensure oven is off
-  else 
-  {
-    digitalWrite(ssrPin, LOW);
+}
+
+// ########## Thermocouple Functions ##########
+void getOvenTemperature() {                       // Read the thermocouple value
+  input = thermocouple.readThermocouple(CELSIUS); // Read current temperature in degrees celcius
+  if ( (input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || (input == FAULT_SHORT_VCC) ){ // If thermocouple problem detected
+    ovenStateInit = true;                         // Flag that we are changing oven states
+    ovenState = OVEN_STATE_ERROR;                 // Drop to the error state
+  }
+}
+
+// ########## Serial Output Functions ##########
+#ifdef DEBUG
+void updateSerial() {
+  // Send all stats to serial terminal
+  // If you change these, update the header output in void setup() also
+  Serial.print(input);
+  Serial.print(" ");
+  Serial.print(setpoint);
+  Serial.print(" ");
+  if ( pidState == PID_STATE_HEAT ){
+  Serial.print(heatOutput);
+#ifdef COOLINGFAN
+  } else if ( pidState == PID_STATE_COOL ){
+  Serial.print(coolOutput);
+#endif
+  } else {
+  Serial.print("0");
+  }
+  Serial.println("");
+}
+#endif
+
+// ########## LCD Display Functions ##########
+void updateLCDDisplay() {                        // Updates the LCD display with the oven state and control info
+  lcd.setCursor(0,0);                            // Oven state uses top row, all 16 chars
+  lcd.print(lcdMessagesOvenStatus[ovenState]);   // Print the oven state
+  if (ovenState == OVEN_STATE_ERROR) {           // If currently in ERROR state
+    lcd.setCursor(0,1);                          // Error text uses bottom row, all 16 chars
+    lcd.print(">>> TC FAULT <<<");               // Show the error text
+  }
+  else {                                         // Otherwise update input (temperature) and output (heatPid or coolPid) values
+    lcd.setCursor(0,1);                          // Temperature uses bottom row, first 9 chars
+    lcd.print(input);                            // Print current temperature
+    lcd.write((uint8_t)0);                       // Print degree Celsius symbol
+    lcd.print("C ");                             // Print the unit and a trailing space to keep the screen clean
+    lcd.setCursor(8,1);                          // PID output uses bottom row, last 7 chars
+    if ( pidState == PID_STATE_HEAT ) {          // If we're heating
+      lcd.print(" H:");                          // Prefix with an "H:" to show we're heating
+      lcd.print(int(heatOutput));                // Print the current heatPid windowSize value
+      lcd.print("    ");                         // And a trailing space to clean up the display
+#ifdef COOLINGFAN
+    } else if ( pidState == PID_STATE_COOL ) {   // If we're cooling
+      lcd.print(" C:");                          // Prefix with a "C:" to chow we're cooling
+      lcd.print(int(coolOutput));                // Print the current coolPid output value
+      lcd.print("    ");                         // And a couple trailing spaces to clean up the diplay
+#endif
+    } else {                                     // If PIDs are off
+      lcd.print(" PID Off");                     // Indicate so
+    }
+  }
+}
+
+// ########## Oven State Functions ##########
+void runOvenState() {
+  // Reflow oven controller state machine
+  switch (ovenState){
+    case OVEN_STATE_IDLE:
+      // Initialize the new state
+      if ( ovenStateInit ){                           // If this is a new state
+        ovenStateInit = false;                        // Unset the state initialization flag
+#ifdef RGBLED
+        ledPatternInit = true;                        // Initialize the LED pattern
+        ledPattern = LED_PATTERN_IDLE;                // Set inidcator LED to IDLE
+#endif
+#ifdef BUZZER
+        buzzerPattern = BUZZER_PATTERN_IDLE;          // Set the buzzer pattern
+#endif
+        pidState = PID_STATE_OFF;                     // Disable all the PIDs
+#ifdef COOLINGFAN
+        coolPID.SetMode(MANUAL);                      // Turn the cool PID off
+#endif
+        heatPID.SetMode(MANUAL);                      // Turn the he PID off
+      }
+      // Check the oven temp and jump to CAUTION if above TEMPERATURE_IDLE
+      if ( input > TEMPERATURE_IDLE ){                // If the oven temperature is above TEMPERATURE_IDLE
+        ovenStateInit = true;                         // Set the state change flag
+        ovenState = OVEN_STATE_CAUTION;               // Change to the CAUTION state
+        break;
+      }
+      // Check for button 1 press and advance to PREHEAT state
+      if ( buttonState == BUTTON_STATE_1 ){           // If button 1 was presssed
+        buttonState = BUTTON_STATE_NONE;              // Clear the button state
+        ovenStateInit = true;                         // Set the state change flag
+        ovenState = OVEN_STATE_PREHEAT;               // Proceed to preheat stage
+        break;
+      }
+      // Check for button 2 press and toggle reflow profile between Pb/Sn and Pb-free.
+      if ( buttonState == BUTTON_STATE_2 ){           // If button 2 was presssed
+        buttonState = BUTTON_STATE_NONE;              // Clear the button state
+        toggleReflowProfile();                        // Toggle the reflow profile
+      }
+      break;
+  
+    case OVEN_STATE_PREHEAT:
+      // Initialize the new state
+      if ( ovenStateInit ){
+        ovenStateInit = false;
+#ifdef RGBLED
+        ledPatternInit = true;
+        ledPattern = LED_PATTERN_HEATING;
+#endif
+#ifdef DOORSERVO
+        doorState = DOOR_STATE_CLOSED;
+#endif
+#ifdef COOLINGFAN
+        coolPID.SetMode(MANUAL);                      // Turn the cool PID off
+#endif
+        pidState = PID_STATE_HEAT;                    // Set PID to heat
+        stepTimerPeriod = TEMPERATURE_PREHEAT_PERIOD; // Set the timer step period
+        setpointStep = TEMPERATURE_PREHEAT_STEP;      // Set the setpoint step increment
+        setpoint = input;                             // Set the initial setpoint
+        setpointMax = TEMPERATURE_PREHEAT_MAX;        // Limit the setpoint
+        windowStartTime = millis();                   // Initialize PID control window starting time
+        heatPID.SetOutputLimits(0, windowSize);       // Tell the PID to range between 0 and the full window size
+        heatPID.SetSampleTime(PID_COMPUTE_PERIOD);    // Set the PID sample time
+        heatPID.SetTunings(PID_KP_PREHEAT, PID_KI_PREHEAT, PID_KD_PREHEAT); // PID parameters for preheat ramp
+        heatPID.SetMode(AUTOMATIC);                   // Turn the cool PID off
+#ifdef BUZZER
+        buzzerPattern = BUZZER_PATTERN_START_REFLOW;  // Activate the buzzer
+#endif
+        stepTimer = millis() + stepTimerPeriod;       // Increment the timer by the step timer period
+      }
+      // Check for button 1 press and cancel reflow.
+      if ( buttonState == BUTTON_STATE_1 ){           // If the button was presssed
+        buttonState = BUTTON_STATE_NONE;              // Reset the button press flag
+        ovenStateInit = true;                         // Flag that we are changing oven states
+        ovenState = OVEN_STATE_CAUTION;               // Proceed to preheat stage
+        break;
+      }
+      // Button 2 has no effect in this state
+      // Advance to the SOAK state
+      if ( input > TEMPERATURE_PREHEAT_MAX ){         // If we've reached the maximum preheat temperature
+        ovenStateInit = true;                         // Flag that we are changing oven states
+        ovenState = OVEN_STATE_SOAK;                  // Change to the SOAK state
+        break;
+      }
+      managePidSetpoint();                            // Adjust the setpoint as necessary to ramp temperature
+      break;
+  
+    case OVEN_STATE_SOAK:
+      // Initialize the new state
+      if ( ovenStateInit ){                        // If this is a new state
+        ovenStateInit = false;                     // Unset the state change flag
+        stepTimerPeriod = TEMPERATURE_SOAK_PERIOD; // Set the timer step period
+        setpointStep = TEMPERATURE_SOAK_STEP;      // Set the setpoint step increment
+        setpoint = input;                          // Set initial setpoint based on current temperature
+        setpointMax = TEMPERATURE_SOAK_MAX + 5;    // We want to overshoot the setpoint a little to start the reflow ramp
+        heatPID.SetTunings(PID_KP_SOAK, PID_KI_SOAK, PID_KD_SOAK); // PID parameters for SOAK state
+        stepTimer = millis() + stepTimerPeriod;    // Increment the timer by the step timer period
+    }
+      // Check for button 1 press and cancel reflow.
+      if ( buttonState == BUTTON_STATE_1 ){        // If the button was presssed
+        buttonState = BUTTON_STATE_NONE;           // Clear the button state
+        ovenStateInit = true;                      // Flag that we are changing oven states
+        ovenState = OVEN_STATE_CAUTION;            // Proceed to preheat stage
+        break;
+      }
+      // Button 2 has no effect in this state
+      // Advance to the REFLOW state
+      if ( input > TEMPERATURE_SOAK_MAX ){         // If we've reached the maximum preheat temperature
+        ovenStateInit = true;                      // Flag that we are changing oven states
+        ovenState = OVEN_STATE_REFLOW;             // Change to the soaking state
+        break;
+      }
+      managePidSetpoint();                         // Adjust the setpoint as necessary to ramp temperature
+      break; 
+  
+    case OVEN_STATE_REFLOW:
+      // Initialize the new state
+      if ( ovenStateInit ){                          // If this is a new state
+        ovenStateInit = false;                       // Unset the state change flag
+        stepTimerPeriod = TEMPERATURE_REFLOW_PERIOD; // Set the timer step period
+        setpointStep = TEMPERATURE_REFLOW_STEP;      // Set the setpoint step increment
+        setpoint = input + 5;                        // Ramp up to minimum soaking temperature
+        setpointMax = TEMPERATURE_REFLOW_MAX;
+        heatPID.SetTunings(PID_KP_REFLOW, PID_KI_REFLOW, PID_KD_REFLOW); // PID parameters for REFLOW state
+        stepTimer = millis() + stepTimerPeriod;      // Increment the timer by the step timer period
+      }
+      // Neither button has any effect in this state
+      // Advance to the COOLING state
+      if ( input > TEMPERATURE_REFLOW_MAX ){         // If we've reached the maximum preheat temperature
+        ovenStateInit = true;                        // Flag that we are changing oven states
+        ovenState = OVEN_STATE_COOLING;              // Change to the soaking state
+        break;
+      }
+      managePidSetpoint();                           // Adjust the setpoint as necessary to ramp temperature
+      break;   
+  
+    case OVEN_STATE_COOLING:
+      // Initialize the new state
+      if ( ovenStateInit ){                           // If this is a new state
+        ovenStateInit = false;                        // Unset the state change flag
+#ifdef RGBLED
+        ledPatternInit = true;
+        ledPattern = LED_PATTERN_COOLING;             // Set inidcator LED to IDLE
+#endif
+        heatPID.SetMode(MANUAL);                      // Turn the cool PID off
+#ifdef DOORSERVO
+        doorState = DOOR_STATE_OPEN;                  // Open the door
+#endif
+        pidState = PID_STATE_COOL;                    // Set PID to heat
+        stepTimerPeriod = TEMPERATURE_COOLING_PERIOD; // Set the timer step period
+        setpointStep = TEMPERATURE_COOLING_STEP;      // Set the setpoint step increment
+        setpoint = input;                             // Ramp up to minimum soaking temperature
+        setpointMax = TEMPERATURE_COOLING_MIN - 5;
+#ifdef COOLINGFAN
+        coolPID.SetOutputLimits(0, 255);              // Tell the PID to range between 0 and the full window size
+        coolPID.SetSampleTime(PID_COMPUTE_PERIOD);    // Set the PID sample time
+        coolPID.SetTunings(PID_KP_COOLING, PID_KI_COOLING, PID_KD_COOLING); // PID parameters for COOLING state
+        coolPID.SetMode(AUTOMATIC);                   // Turn the cool PID off
+        stepTimer = millis() + stepTimerPeriod;       // Increment the timer by the step timer period
+#endif
+    }
+      // Neither button has any effect in this state
+      // Advance to the IDLE state
+      if ( input < TEMPERATURE_COOLING_MIN ){         // If we've reached the maximum preheat temperature
+#ifdef BUZZER
+        buzzerPattern = BUZZER_PATTERN_END_REFLOW;    // Activate the buzzer
+#endif
+        ovenStateInit = true;                         // Flag that we are changing oven states
+        ovenState = OVEN_STATE_IDLE;                  // Change to the soaking state
+        break;
+      }
+      managePidSetpoint();                            // Adjust the setpoint as necessary to ramp temperature
+      break;    
+  
+    case OVEN_STATE_CAUTION:
+      // Initialize the new state
+      if ( ovenStateInit ){                     // If this is a new state
+        ovenStateInit = false;                  // Unset the state change flag
+#ifdef RGBLED
+        ledPatternInit = true;
+        ledPattern = LED_PATTERN_CAUTION;       // Set inidcator LED to IDLE
+#endif
+        heatPID.SetMode(MANUAL);                // Turn the cool PID off
+#ifdef DOORSERVO
+        doorState = DOOR_STATE_OPEN;            // Open the door
+#endif
+        pidState = PID_STATE_COOL;              // Set PID to heat
+        setpoint = TEMPERATURE_IDLE - 5;        // We want to cool as quickly as possible
+#ifdef COOLINGFAN
+        coolPID.SetTunings(PID_KP_COOLING, PID_KI_COOLING, PID_KD_COOLING); // PID parameters for preheat ramp
+        coolPID.SetMode(AUTOMATIC);             // Turn the cool PID off
+#endif
+#ifdef BUZZER
+        buzzerPatternInit = true;
+        buzzerPattern = BUZZER_PATTERN_CAUTION; // Activate the buzzer
+#endif
+        stepTimer = millis() + stepTimerPeriod; // Increment the timer by the step timer period
+    }
+      // Return to the IDLE state
+      if ( input < TEMPERATURE_IDLE ){          // If we've reached the maximum preheat temperature
+        ovenStateInit = true;                   // Flag that we are changing oven states
+        ovenState = OVEN_STATE_IDLE;            // Change to the soaking state
+        break;
+      }
+      break;
+  
+    case OVEN_STATE_ERROR:
+      // Initialize the new state
+      if ( ovenStateInit ){                   // If this is a new state
+        ovenStateInit = false;                // Unset the state change flag
+#ifdef RGBLED
+        ledPatternInit = true;
+        ledPattern = LED_PATTERN_ERROR;       // Set inidcator LED to IDLE
+#endif
+#ifdef COOLINGFAN
+        coolPID.SetMode(MANUAL);              // Turn the cool PID off
+#endif
+        heatPID.SetMode(MANUAL);              // Turn the cool PID off
+#ifdef DOORSERVO
+        doorState = DOOR_STATE_RELEASE;       // Release the door
+#endif
+        pidState = PID_STATE_OFF;             // Set PID to heat
+#ifdef BUZZER
+        buzzerPattern = BUZZER_PATTERN_ERROR; // Activate the buzzer
+#endif
+      }
+      // Recheck error condition
+      if ((input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || (input == FAULT_SHORT_VCC)) { // If any of the error conditions still exist
+        ovenState = OVEN_STATE_ERROR;         // Maintain the error condition
+      }
+      else {                                  // Otherwise
+        ovenStateInit = true;                 // Flag that we are changing oven states
+        ovenState = OVEN_STATE_IDLE;          // Return to IDLE state
+      }
+      break;    
   }
 }
