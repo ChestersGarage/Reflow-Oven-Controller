@@ -1,7 +1,8 @@
 Readme
 ******
 
-Features:
+Features
+========
 - PID controlled in all stages of operation for heating and cooling
 - Servo-controlled door
 - Cooling fan
@@ -24,7 +25,6 @@ Required Libraries
 >> https://github.com/rocketscream/MAX31855
 
 IMPORTANT
-#########
+=========
 - Due to pin usage and additional feature support, this fork is not compatible with the RocketScream Reflow Oven Controller Shield.
 - MAX6675 is no longer supported.
-- 
