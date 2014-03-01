@@ -7,7 +7,7 @@ Changes:
 - Almost a total rewrite to modularize the sketch so that features can be easily enabled/disabled
 
 Known Issues:
-- Reflow stages may be a little sketchy.  be sure tio tune for your oven
+- Reflow stages may be a little sketchy.  Be sure to tune for your oven!
 - Reflow profiles for Pb/Sn and Pb-Free don't work (always Pb-Free)
 
 To-do:
