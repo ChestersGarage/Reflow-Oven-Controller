@@ -159,6 +159,7 @@ typedef enum OVEN_STATE {               // Defines the different states and stag
   OVEN_STATE_PREHEAT,                   // Preheat stage of the reflow process
   OVEN_STATE_SOAK,                      // Soak stage of the reflow process
   OVEN_STATE_REFLOW,                    // Reflow stage of the reflow process
+  OVEN_STATE_HOLD,                      // Hold stage of the reflow proces
   OVEN_STATE_COOLING,                   // Cooling stage of the reflow process
   OVEN_STATE_CAUTION,                   // The oven is idle but still hot
   OVEN_STATE_ERROR,                     // A problem with the thermocouple
@@ -166,20 +167,30 @@ typedef enum OVEN_STATE {               // Defines the different states and stag
 ovenState_t ovenState;                  // Reflow oven controller state machine state variable
 
 // ########## PID Control ##########
-#define TEMPERATURE_IDLE 50             // Oven maximum IDLE temperature.
-#define TEMPERATURE_PREHEAT_STEP 9      // Number of degrees C per PERIOD the PREHEAT stage can heat up
-#define TEMPERATURE_PREHEAT_PERIOD 3000 // Time between PREHEAT steps
-#define TEMPERATURE_PREHEAT_MAX 150     // Target temperature of the PREHEAT stage
-#define TEMPERATURE_SOAK_STEP 5         // Maximum number of degrees C per PERIOD the SOAK stage can heat up
-#define TEMPERATURE_SOAK_PERIOD 9000    // Time between SOAK steps
-#define TEMPERATURE_SOAK_MAX 200        // Target temperature of the SOAK stage
-#define TEMPERATURE_REFLOW_STEP 9       // Maximum number of degrees C per PERIOD the REFLOW stage can heat up
-#define TEMPERATURE_REFLOW_PERIOD 3000  // Time between REFLOW steps
-#define TEMPERATURE_REFLOW_MAX 250      // Target temperature of the REFLOW stage
-#define TEMPERATURE_COOLING_STEP 6      // Number of degrees C per PERIOD the COOLING stage can cool down
-#define TEMPERATURE_COOLING_PERIOD 2000 // Time between COOLING steps
-#define TEMPERATURE_COOLING_MIN 50      // Target temperature of the COOLING stage
-#define PID_COMPUTE_PERIOD 250          // How often the PID will be evaluated
+#define HEAT_PID_COMPUTE_PERIOD 1000         // How often the PID will be evaluated
+#define COOL_PID_COMPUTE_PERIOD 100
+#define TEMPERATURE_IDLE_MAX 50         // Oven maximum IDLE temperature.
+#define TEMPERATURE_PREHEAT_STEP 3      // Number of degrees C per PERIOD the PREHEAT stage can heat up
+#define TEMPERATURE_PREHEAT_PERIOD 1000 // Time between PREHEAT steps
+#define TEMPERATURE_SOAK_STEP 0.5         // Maximum number of degrees C per PERIOD the SOAK stage can heat up
+#define TEMPERATURE_SOAK_PERIOD 1000    // Time between SOAK steps
+#define TEMPERATURE_REFLOW_STEP 3       // Maximum number of degrees C per PERIOD the REFLOW stage can heat up
+#define TEMPERATURE_REFLOW_PERIOD 1000  // Time between REFLOW steps
+#define TEMPERATURE_COOLING_STEP 3      // Number of degrees C per PERIOD the COOLING stage can cool down
+#define TEMPERATURE_COOLING_PERIOD 1000 // Time between COOLING steps
+// Pb-Free profile
+#define PBFREE_PREHEAT_MAX 150     // Target temperature of the PREHEAT stage
+#define PBFREE_SOAK_MAX 200        // Target temperature of the SOAK stage
+#define PBFREE_REFLOW_MAX 250      // Target temperature of the REFLOW stage
+// Pb/Sn profile
+#define PBSN_PREHEAT_MAX 100       // Target temperature of the PREHEAT stage
+#define PBSN_SOAK_MAX 150          // Target temperature of the SOAK stage
+#define PBSN_REFLOW_MAX 220        // Target temperature of the REFLOW stage
+// Set temperature for the initial profile (PB-Free)
+byte reflowProfilePreheatMax = PBFREE_PREHEAT_MAX;
+byte reflowProfileSoakMax = PBFREE_SOAK_MAX;
+byte reflowProfileReflowMax = PBFREE_REFLOW_MAX;
+
 // Preheat stage PID tuning
 #define PID_KP_PREHEAT 100
 #define PID_KI_PREHEAT 0.025
@@ -192,10 +203,14 @@ ovenState_t ovenState;                  // Reflow oven controller state machine 
 #define PID_KP_REFLOW 300
 #define PID_KI_REFLOW 0.05
 #define PID_KD_REFLOW 350
+// Hold stage PID tuning
+#define PID_KP_HOLD 300
+#define PID_KI_HOLD 0.05
+#define PID_KD_HOLD 250
 // Cooling stage PID tuning
-#define PID_KP_COOLING 25
-#define PID_KI_COOLING 0.0125
-#define PID_KD_COOLING 5
+#define PID_KP_COOLING 300
+#define PID_KI_COOLING 0.005
+#define PID_KD_COOLING 25
 // General PID variables
 double input;                      // The input is the temperature reading form the thermocouple
 double kp = PID_KP_PREHEAT;        // Since the first stage is always PREHEAT, we set it here
@@ -204,11 +219,15 @@ double kd = PID_KD_PREHEAT;
 double setpoint;                   // The current target temperature of the PID.  This changes a lot.
 double setpointMax;                // The maximum setpoint for any given stage.  Eliminates severe overshoot
 byte setpointStep;                 // The number of degrees C to increment the setpoint for the current stage
-int windowSize = 1000;             // The duration of the PID window in millis()
+unsigned long holdTimer;           // Timer for the HOLD reflow stage
+int holdTimerPeriod = 10000;       // How long the hold timer runs
+int heatPidWindowSize = 120;       // The resolution of the PID window (60 Hz line voltage has 120 steps per second)
+int coolPidWindowSize = 511;       // 0-255 maps to the door angle full open to full closed. 256-512 maps to the fan PWM 0-255.
+float heatPidWindowSizeMultiplier = 8.33; // Multiply window size by this to get milliseconds. For 50Hz, set to 10.00)
 unsigned long windowStartTime;     // Time in millis() when the PID window started
 unsigned long rightNow;            // Current time in millis()
 unsigned long stepTimer;           // The timer used to increment setpoint through the PID ramp time
-int stepTimerPeriod;               // The time in millis() to increment the timer for the current stage
+int stepTimerPeriod = 1000;               // The time in millis() to increment the timer for the current stage
 typedef enum PID_STATE {           // Defines the possibel PID states
   PID_STATE_OFF,                   // PIDs are off
   PID_STATE_HEAT,                  // Heater PID is running
@@ -222,15 +241,18 @@ double heatOutput;                 // The heat PID output variable
 #ifdef COOLINGFAN                  // This section used only if you have a cooling fan
 #define fanPin 6                   // The Arduino pin of the cooling fan
 double coolOutput;                 // The output variable of the cooling PID
+byte doorPositionCooling;
+byte fanSpeed;
 #endif
 
 // ########## LCD Display ##########
 const char* lcdMessagesOvenStatus[] = {  // Defines all of the standard LCD messages
   "-- Oven Ready --",                    // Oven IDLE state
-  "Stage: Preheat  ",                    // Reflow PREHEAT stage
-  "Stage: Soak     ",                    // Reflow SOAK stage
-  "Stage: Reflow   ",                    // Reflow REFLOW stage
-  "Stage: Cooling  ",                    // Reflow COOLING stage
+  "Preheat ",                    // Reflow PREHEAT stage
+  "Soak    ",                    // Reflow SOAK stage
+  "Reflow  ",                    // Reflow REFLOW stage
+  "Hold    ",                    // Reflow HOLD stage
+  "Cooling ",                    // Reflow COOLING stage
   "+++ OVEN HOT +++",                    // Oven CAUTION state
   "**** ERROR! ****",                    // Oven ERROR state
 };
@@ -259,7 +281,7 @@ unsigned long nextDisplay;                // The time in millis() when to update
 unsigned long nextRead;                   // When to read the thermocouple next
 
 // ########## Reflow Profile ##########
-boolean reflowProfile = 0;                // 0: Pb-Free, 1: Pb/Sn
+boolean reflowProfilePbSn = 0;                // 0: Pb-Free, 1: Pb/Sn
 
 // ########## Buttons ##########
 #define buttonPin A0                      // Arduino pin used for the button input
@@ -280,7 +302,7 @@ buttonState_t buttonState;                // Button press status
 #define DOOR_OPEN_LIMIT 38                // Servo position when the door is fully open
 #define DOOR_CLOSE_LIMIT 168              // Servo position when the door is fully closed
 #define doorServoPin 5                    // Arduino pin used for the servo 
-boolean doorStateInit = false;            // if true, we just started opening the door
+boolean doorStateInit;            // if true, we just started opening the door
 byte doorPosition;                        // Range 0-180 degrees; For my servo, lower number is open and higher is closed
 byte doorMovePeriod;                      // How long to wait between increments of door movement
 byte doorMoveStep;                        // How far to move the door in each increment
@@ -290,6 +312,7 @@ typedef	enum DOOR_STATE {                 // Define the diffeerent states of the
   DOOR_STATE_RELEASE,                     // Release the door (detach the servo)
   DOOR_STATE_OPEN,	                  // The door is open
   DOOR_STATE_CLOSED,                      // The way is shut.
+  DOOR_STATE_PID,                         // The door position is part of the cooling PID
 } doorState_t;
 doorState_t doorState;                    // Door (servo) status
 #endif
@@ -491,6 +514,21 @@ void controlDoor(){
           } else {                                    // If it is at the closed limit
             doorState = DOOR_STATE_RELEASE;           // Release servo control of the door.
           }
+        }
+      }
+    break;
+
+    case DOOR_STATE_PID:
+      if ( doorStateInit ){                           // If we are initializing
+        doorStateInit = false;                        // Flip the initialize bit
+        doorMovePeriod = COOL_PID_COMPUTE_PERIOD;     // Set the step timer increment
+        doorServo.attach(doorServoPin);               // Attach the servo
+        doorPosition = DOOR_CLOSE_LIMIT;              // Set the current (starting) position
+        doorMoveTime = millis() + doorMovePeriod;     // Increment the door step timer
+      } else {                                        // If the door is already initialized
+        if ( millis() >= doorMoveTime ){              // Then check to see if it's time to move it some more
+          doorMoveTime = millis() + doorMovePeriod;   // Increment the step timer
+          doorServo.write(doorPosition);              // Move the door a little more
         }
       }
     break;
@@ -699,10 +737,10 @@ void computePID() {                                    // Heat/cool PID computat
   if ( pidState == PID_STATE_HEAT ){                   // If we're in heating mode
     rightNow = millis();                               // Capture the current time
     heatPID.Compute();                                 // Compute the heating PID
-    if ( rightNow > (windowStartTime + windowSize) ){  // If the PID output window has elapsed
-      windowStartTime += windowSize;                   // Reset the window start time
+    if ( rightNow >= (windowStartTime + (heatPidWindowSize*heatPidWindowSizeMultiplier)) ){  // If the PID output window has elapsed (8.33 converts windowsSize to milliseconds)
+      windowStartTime += (heatPidWindowSize*heatPidWindowSizeMultiplier);                   // Reset the window start time
     }
-    if ( (rightNow - windowStartTime) <= heatOutput ){ // If the elsapsed time is less than the heater PID output
+    if ( (rightNow - windowStartTime) <= (heatOutput*heatPidWindowSizeMultiplier) ){ // If the elsapsed time is less than the heater PID output
       digitalWrite(ssrPin, HIGH);                      // Make sure the heating element is on
     } else {
       digitalWrite(ssrPin, LOW);                       // Otherwise shut it off
@@ -713,7 +751,15 @@ void computePID() {                                    // Heat/cool PID computat
 #ifdef COOLINGFAN
   if ( pidState == PID_STATE_COOL ){                   // If we're in cooling mode
     coolPID.Compute();                                 // Compute the cooling PID
-    analogWrite(fanPin,coolOutput);                    // And set the fan speed
+    doorPosition = map(coolOutput,0,255,DOOR_CLOSE_LIMIT,DOOR_OPEN_LIMIT);
+    fanSpeed = map(coolOutput,256,511,1,255);
+    if ( coolOutput > 255 ) {
+      doorPosition = DOOR_OPEN_LIMIT;
+    }
+    if ( coolOutput < 256 ){
+      fanSpeed = 1;
+    }
+    analogWrite(fanPin,fanSpeed);                    // And set the fan speed
   } else {                                             // If we're NOT in cooling mode
     analogWrite(fanPin,0);                             // Turn off the fan
   }
@@ -721,17 +767,23 @@ void computePID() {                                    // Heat/cool PID computat
 }
 
 // ########## Reflow Profile Functions ##########
-void toggleReflowProfile(){        // Switched between lead and lead free reflow profiles
-  reflowProfile = !reflowProfile;  // Flip the reflow profile flag
-  lcd.setCursor(0,1);              // Place the LCD cursor on the second line
-  if ( reflowProfile ){            // If the profile is now Pb/Sn
-    lcd.print("Profile: Pb/Sn  "); // Print Pb/Sn
+void toggleReflowProfile(){               // Switched between lead and lead free reflow profiles
+  reflowProfilePbSn = !reflowProfilePbSn; // Flip the reflow profile flag
+  lcd.setCursor(0,1);                     // Place the LCD cursor on the second line
+  if ( reflowProfilePbSn ){               // If the profile is now Pb/Sn
+    reflowProfilePreheatMax = PBSN_PREHEAT_MAX;
+    reflowProfileSoakMax = PBSN_SOAK_MAX;
+    reflowProfileReflowMax = PBSN_REFLOW_MAX;
+    lcd.print("Profile: Pb/Sn  ");        // Print Pb/Sn
   }
-  else{                            // Otherwise
-    lcd.print("Profile: Pb-Free"); // Print Pb-Free
+  else{                                   // Otherwise
+    reflowProfilePreheatMax = PBFREE_PREHEAT_MAX;
+    reflowProfileSoakMax = PBFREE_SOAK_MAX;
+    reflowProfileReflowMax = PBFREE_REFLOW_MAX;
+    lcd.print("Profile: Pb-Free");        // Print Pb-Free
   }
-  delay(2000);                     // Wait for 3 seconds
-  lcd.clear();                     // And then wipe the screen
+  delay(2000);                            // Wait a moment
+  lcd.clear();                            // And then wipe the screen
 }
 
 // ########## Button Functions ##########
@@ -798,6 +850,13 @@ void updateSerial() {
 // ########## LCD Display Functions ##########
 void updateLCDDisplay() {                        // Updates the LCD display with the oven state and control info
   lcd.setCursor(0,0);                            // Oven state uses top row, all 16 chars
+  if ( ovenState == OVEN_STATE_PREHEAT || ovenState == OVEN_STATE_SOAK || ovenState == OVEN_STATE_REFLOW || ovenState == OVEN_STATE_HOLD || ovenState == OVEN_STATE_COOLING ){
+    if ( reflowProfilePbSn ){
+      lcd.print(" Pb/Sn: ");
+    } else {
+      lcd.print("Pb-Free: ");
+    }
+  }
   lcd.print(lcdMessagesOvenStatus[ovenState]);   // Print the oven state
   if (ovenState == OVEN_STATE_ERROR) {           // If currently in ERROR state
     lcd.setCursor(0,1);                          // Error text uses bottom row, all 16 chars
@@ -811,7 +870,7 @@ void updateLCDDisplay() {                        // Updates the LCD display with
     lcd.setCursor(8,1);                          // PID output uses bottom row, last 7 chars
     if ( pidState == PID_STATE_HEAT ) {          // If we're heating
       lcd.print(" H:");                          // Prefix with an "H:" to show we're heating
-      lcd.print(int(heatOutput));                // Print the current heatPid windowSize value
+      lcd.print(int(heatOutput));                // Print the current heatPid heatPidWindowSize value
       lcd.print("    ");                         // And a trailing space to clean up the display
 #ifdef COOLINGFAN
     } else if ( pidState == PID_STATE_COOL ) {   // If we're cooling
@@ -840,14 +899,17 @@ void runOvenState() {
 #ifdef BUZZER
         buzzerPattern = BUZZER_PATTERN_IDLE;          // Set the buzzer pattern
 #endif
+#ifdef DOORSERVO
+        doorState = DOOR_STATE_RELEASE;            // Open the door
+#endif
         pidState = PID_STATE_OFF;                     // Disable all the PIDs
 #ifdef COOLINGFAN
         coolPID.SetMode(MANUAL);                      // Turn the cool PID off
 #endif
         heatPID.SetMode(MANUAL);                      // Turn the he PID off
       }
-      // Check the oven temp and jump to CAUTION if above TEMPERATURE_IDLE
-      if ( input > TEMPERATURE_IDLE ){                // If the oven temperature is above TEMPERATURE_IDLE
+      // Check the oven temp and jump to CAUTION if above TEMPERATURE_IDLE_MAX
+      if ( input > TEMPERATURE_IDLE_MAX ){                // If the oven temperature is above TEMPERATURE_IDLE_MAX
         ovenStateInit = true;                         // Set the state change flag
         ovenState = OVEN_STATE_CAUTION;               // Change to the CAUTION state
         break;
@@ -884,10 +946,10 @@ void runOvenState() {
         stepTimerPeriod = TEMPERATURE_PREHEAT_PERIOD; // Set the timer step period
         setpointStep = TEMPERATURE_PREHEAT_STEP;      // Set the setpoint step increment
         setpoint = input;                             // Set the initial setpoint
-        setpointMax = TEMPERATURE_PREHEAT_MAX;        // Limit the setpoint
+        setpointMax = reflowProfilePreheatMax - 2;        // Limit the setpoint
         windowStartTime = millis();                   // Initialize PID control window starting time
-        heatPID.SetOutputLimits(0, windowSize);       // Tell the PID to range between 0 and the full window size
-        heatPID.SetSampleTime(PID_COMPUTE_PERIOD);    // Set the PID sample time
+        heatPID.SetOutputLimits(0, heatPidWindowSize);       // Tell the PID to range between 0 and the full window size
+        heatPID.SetSampleTime(HEAT_PID_COMPUTE_PERIOD);    // Set the PID sample time
         heatPID.SetTunings(PID_KP_PREHEAT, PID_KI_PREHEAT, PID_KD_PREHEAT); // PID parameters for preheat ramp
         heatPID.SetMode(AUTOMATIC);                   // Turn the cool PID off
 #ifdef BUZZER
@@ -904,7 +966,7 @@ void runOvenState() {
       }
       // Button 2 has no effect in this state
       // Advance to the SOAK state
-      if ( input > TEMPERATURE_PREHEAT_MAX ){         // If we've reached the maximum preheat temperature
+      if ( input > reflowProfilePreheatMax ){         // If we've reached the maximum preheat temperature
         ovenStateInit = true;                         // Flag that we are changing oven states
         ovenState = OVEN_STATE_SOAK;                  // Change to the SOAK state
         break;
@@ -919,7 +981,7 @@ void runOvenState() {
         stepTimerPeriod = TEMPERATURE_SOAK_PERIOD; // Set the timer step period
         setpointStep = TEMPERATURE_SOAK_STEP;      // Set the setpoint step increment
         setpoint = input;                          // Set initial setpoint based on current temperature
-        setpointMax = TEMPERATURE_SOAK_MAX + 5;    // We want to overshoot the setpoint a little to start the reflow ramp
+        setpointMax = reflowProfileSoakMax + 5;    // We want to overshoot the setpoint a little to start the reflow ramp
         heatPID.SetTunings(PID_KP_SOAK, PID_KI_SOAK, PID_KD_SOAK); // PID parameters for SOAK state
         stepTimer = millis() + stepTimerPeriod;    // Increment the timer by the step timer period
     }
@@ -932,7 +994,7 @@ void runOvenState() {
       }
       // Button 2 has no effect in this state
       // Advance to the REFLOW state
-      if ( input > TEMPERATURE_SOAK_MAX ){         // If we've reached the maximum preheat temperature
+      if ( input > reflowProfileSoakMax ){         // If we've reached the maximum preheat temperature
         ovenStateInit = true;                      // Flag that we are changing oven states
         ovenState = OVEN_STATE_REFLOW;             // Change to the soaking state
         break;
@@ -947,18 +1009,34 @@ void runOvenState() {
         stepTimerPeriod = TEMPERATURE_REFLOW_PERIOD; // Set the timer step period
         setpointStep = TEMPERATURE_REFLOW_STEP;      // Set the setpoint step increment
         setpoint = input + 5;                        // Ramp up to minimum soaking temperature
-        setpointMax = TEMPERATURE_REFLOW_MAX;
+        setpointMax = reflowProfileReflowMax;
         heatPID.SetTunings(PID_KP_REFLOW, PID_KI_REFLOW, PID_KD_REFLOW); // PID parameters for REFLOW state
         stepTimer = millis() + stepTimerPeriod;      // Increment the timer by the step timer period
       }
       // Neither button has any effect in this state
       // Advance to the COOLING state
-      if ( input > TEMPERATURE_REFLOW_MAX ){         // If we've reached the maximum preheat temperature
+      if ( input >= reflowProfileReflowMax ){         // If we've reached the maximum preheat temperature
         ovenStateInit = true;                        // Flag that we are changing oven states
-        ovenState = OVEN_STATE_COOLING;              // Change to the soaking state
+        ovenState = OVEN_STATE_HOLD;              // Change to the soaking state
         break;
       }
       managePidSetpoint();                           // Adjust the setpoint as necessary to ramp temperature
+      break;   
+  
+    case OVEN_STATE_HOLD:
+      // Initialize the new state
+      if ( ovenStateInit ){                          // If this is a new state
+        ovenStateInit = false;                       // Unset the state change flag
+        setpoint = reflowProfileReflowMax;           // Ramp up to minimum soaking temperature
+        heatPID.SetTunings(PID_KP_HOLD, PID_KI_HOLD, PID_KD_HOLD); // PID parameters for REFLOW state
+        holdTimer = millis() + holdTimerPeriod;      // Set the hold timer
+      }
+      // Neither button has any effect in this state
+      // Advance to the COOLING state
+      if ( millis() >= holdTimer ){         // If we've reached the maximum preheat temperature
+        ovenStateInit = true;                        // Flag that we are changing oven states
+        ovenState = OVEN_STATE_COOLING;              // Change to the soaking state
+      }
       break;   
   
     case OVEN_STATE_COOLING:
@@ -971,16 +1049,17 @@ void runOvenState() {
 #endif
         heatPID.SetMode(MANUAL);                      // Turn the cool PID off
 #ifdef DOORSERVO
-        doorState = DOOR_STATE_OPEN;                  // Open the door
+        doorStateInit = true;
+        doorState = DOOR_STATE_PID;                   // Open the door
 #endif
         pidState = PID_STATE_COOL;                    // Set PID to heat
         stepTimerPeriod = TEMPERATURE_COOLING_PERIOD; // Set the timer step period
         setpointStep = TEMPERATURE_COOLING_STEP;      // Set the setpoint step increment
         setpoint = input;                             // Ramp up to minimum soaking temperature
-        setpointMax = TEMPERATURE_COOLING_MIN - 5;
+        setpointMax = TEMPERATURE_IDLE_MAX - 5;
 #ifdef COOLINGFAN
-        coolPID.SetOutputLimits(0, 255);              // Tell the PID to range between 0 and the full window size
-        coolPID.SetSampleTime(PID_COMPUTE_PERIOD);    // Set the PID sample time
+        coolPID.SetOutputLimits(0, coolPidWindowSize);              // Tell the PID to range between 0 and the full window size
+        coolPID.SetSampleTime(COOL_PID_COMPUTE_PERIOD);    // Set the PID sample time
         coolPID.SetTunings(PID_KP_COOLING, PID_KI_COOLING, PID_KD_COOLING); // PID parameters for COOLING state
         coolPID.SetMode(AUTOMATIC);                   // Turn the cool PID off
         stepTimer = millis() + stepTimerPeriod;       // Increment the timer by the step timer period
@@ -988,7 +1067,7 @@ void runOvenState() {
     }
       // Neither button has any effect in this state
       // Advance to the IDLE state
-      if ( input < TEMPERATURE_COOLING_MIN ){         // If we've reached the maximum preheat temperature
+      if ( input < TEMPERATURE_IDLE_MAX ){         // If we've reached the maximum preheat temperature
 #ifdef BUZZER
         buzzerPattern = BUZZER_PATTERN_END_REFLOW;    // Activate the buzzer
 #endif
@@ -1007,14 +1086,17 @@ void runOvenState() {
         ledPatternInit = true;
         ledPattern = LED_PATTERN_CAUTION;       // Set inidcator LED to IDLE
 #endif
-        heatPID.SetMode(MANUAL);                // Turn the cool PID off
+        heatPID.SetMode(MANUAL);                // Turn the heat PID off
 #ifdef DOORSERVO
-        doorState = DOOR_STATE_OPEN;            // Open the door
+        doorStateInit = true;
+        doorState = DOOR_STATE_PID;             // Use the door as part of the cooling PID
 #endif
         pidState = PID_STATE_COOL;              // Set PID to heat
-        setpoint = TEMPERATURE_IDLE - 5;        // We want to cool as quickly as possible
+        setpoint = TEMPERATURE_IDLE_MAX - 10;   // We want to cool as quickly as possible
 #ifdef COOLINGFAN
-        coolPID.SetTunings(PID_KP_COOLING, PID_KI_COOLING, PID_KD_COOLING); // PID parameters for preheat ramp
+        coolPID.SetOutputLimits(0, coolPidWindowSize);              // Tell the PID to range between 0 and the full window size
+        coolPID.SetSampleTime(COOL_PID_COMPUTE_PERIOD);    // Set the PID sample time
+        coolPID.SetTunings(PID_KP_COOLING, PID_KI_COOLING, PID_KD_COOLING); // PID parameters for COOLING state
         coolPID.SetMode(AUTOMATIC);             // Turn the cool PID off
 #endif
 #ifdef BUZZER
@@ -1024,7 +1106,7 @@ void runOvenState() {
         stepTimer = millis() + stepTimerPeriod; // Increment the timer by the step timer period
     }
       // Return to the IDLE state
-      if ( input < TEMPERATURE_IDLE ){          // If we've reached the maximum preheat temperature
+      if ( input < TEMPERATURE_IDLE_MAX ){      // If we've reached the maximum preheat temperature
         ovenStateInit = true;                   // Flag that we are changing oven states
         ovenState = OVEN_STATE_IDLE;            // Change to the soaking state
         break;
